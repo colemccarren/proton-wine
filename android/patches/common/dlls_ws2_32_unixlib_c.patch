@@ -1,0 +1,52 @@
+diff --git a/dlls/ws2_32/unixlib.c b/dlls/ws2_32/unixlib.c
+index e0e1263..de3a52d 100644
+--- a/dlls/ws2_32/unixlib.c
++++ b/dlls/ws2_32/unixlib.c
+@@ -1044,9 +1044,44 @@ static NTSTATUS unix_gethostname( void *args )
+ {
+     struct gethostname_params *params = args;
+ 
+-    if (!gethostname( params->name, params->size ))
+-        return 0;
+-    return errno_from_unix( errno );
++    if (gethostname( params->name, params->size ))
++        return errno_from_unix( errno );
++
++#ifdef __ANDROID__
++    /* Android's hostname is "localhost", so applications that discover their own address via
++     * getaddrinfo(gethostname()) - notably Epic Online Services P2P - resolve 127.0.0.1 and bind
++     * their gameplay sockets to loopback, which breaks online multiplayer. When the hostname is
++     * loopback-only, report the real LAN address instead: a connected UDP socket + getsockname()
++     * yields the source address the kernel would use, without needing interface enumeration
++     * (which the app sandbox filters). A subsequent getaddrinfo() then returns a usable address.
++     * connect() on a datagram socket sends no packets. */
++    if (!params->name[0] || !strcmp( params->name, "localhost" ))
++    {
++        int s = socket( AF_INET, SOCK_DGRAM, 0 );
++        if (s >= 0)
++        {
++            struct sockaddr_in dst;
++            socklen_t len = sizeof(dst);
++            char ip[INET_ADDRSTRLEN];
++
++            memset( &dst, 0, sizeof(dst) );
++            dst.sin_family = AF_INET;
++            dst.sin_port = htons( 53 );
++            dst.sin_addr.s_addr = htonl( 0x08080808 ); /* 8.8.8.8, reachable via the default route */
++            if (!connect( s, (struct sockaddr *)&dst, sizeof(dst) ) &&
++                !getsockname( s, (struct sockaddr *)&dst, &len ) &&
++                dst.sin_addr.s_addr && (ntohl( dst.sin_addr.s_addr ) >> 24) != 127 &&
++                inet_ntop( AF_INET, &dst.sin_addr, ip, sizeof(ip) ) &&
++                strlen( ip ) < params->size)
++            {
++                TRACE( "android: reporting hostname as LAN address %s (was loopback)\n", ip );
++                memcpy( params->name, ip, strlen( ip ) + 1 );
++            }
++            close( s );
++        }
++    }
++#endif
++    return 0;
+ }
+ 
+ 
