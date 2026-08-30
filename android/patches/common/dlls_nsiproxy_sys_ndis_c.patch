@@ -1,5 +1,5 @@
 diff --git a/dlls/nsiproxy.sys/ndis.c b/dlls/nsiproxy.sys/ndis.c
-index 158a39e..ff5dcc8 100644
+index 158a39e..a90ad5b 100644
 --- a/dlls/nsiproxy.sys/ndis.c
 +++ b/dlls/nsiproxy.sys/ndis.c
 @@ -23,7 +23,8 @@
@@ -40,8 +40,42 @@ index 158a39e..ff5dcc8 100644
  
      entry->if_luid.Info.Reserved = 0;
      entry->if_luid.Info.NetLuidIndex = index;
-@@ -330,9 +340,35 @@ static struct if_entry *add_entry( UINT index, const char *name )
+@@ -328,11 +338,69 @@ static struct if_entry *add_entry( UINT index, const char *name )
+     return entry;
+ }
  
++#ifdef __ANDROID__
++/* Read the active (first non-loopback) interface name from /proc/net/route, which stays
++ * readable under the Android app sandbox even when interface enumeration does not expose the
++ * interface. Android often keeps the default route in a separate table not visible here, so we
++ * accept any on-link route on a real interface rather than requiring a default route. */
++static BOOL android_active_iface( char *name, size_t len )
++{
++    FILE *fp;
++    char buf[512];
++    BOOL found = FALSE;
++
++    if (!(fp = fopen( "/proc/net/route", "r" ))) return FALSE;
++    if (!fgets( buf, sizeof(buf), fp )) { fclose( fp ); return FALSE; } /* header */
++    while (fgets( buf, sizeof(buf), fp ))
++    {
++        char iface[IFNAMSIZ];
++        if (sscanf( buf, "%15s", iface ) < 1) continue;
++        if (!strcmp( iface, "lo" )) continue;
++        {
++            size_t n = strlen( iface ); /* iface is <= 15 chars from %15s */
++            if (n > len - 1) n = len - 1;
++            memcpy( name, iface, n );
++            name[n] = 0;
++        }
++        found = TRUE;
++        break;
++    }
++    fclose( fp );
++    return found;
++}
++#endif /* __ANDROID__ */
++
  static unsigned int update_if_table( void )
  {
 -    struct if_nameindex *indices = if_nameindex(), *entry;
@@ -77,7 +111,34 @@ index 158a39e..ff5dcc8 100644
  
      for (entry = indices; entry->if_index; entry++)
      {
-@@ -532,7 +568,10 @@ static NTSTATUS ifinfo_enumerate_all( void *key_data, UINT key_size, void *rw_da
+@@ -349,6 +417,26 @@ static unsigned int update_if_table( void )
+         ++append_count;
+     }
+ 
++#ifdef __ANDROID__
++    /* The sandbox can hide the active Wi-Fi/cellular interface from if_nameindex(); make sure the
++     * active interface is present so its address (recovered in ip.c) resolves to a LUID.
++     * Idempotent: find_entry_from_index() skips it when enumeration already added the interface. */
++    {
++        char name[IFNAMSIZ];
++        unsigned int idx;
++        if (android_active_iface( name, sizeof(name) ))
++        {
++            idx = if_nametoindex( name );
++            if (!idx) idx = 0xb0ba; /* synthetic index if SIOCGIFINDEX is blocked */
++            if (!find_entry_from_index( idx ) && add_entry( idx, name ))
++            {
++                TRACE( "android: added active interface %s (index %u) missing from enumeration\n", name, idx );
++                ++append_count;
++            }
++        }
++    }
++#endif
++
+     return append_count;
+ }
+ 
+@@ -532,7 +620,10 @@ static NTSTATUS ifinfo_enumerate_all( void *key_data, UINT key_size, void *rw_da
      pthread_mutex_lock( &if_list_lock );
  
      update_if_table();

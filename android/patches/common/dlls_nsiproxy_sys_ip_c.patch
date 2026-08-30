@@ -1,5 +1,5 @@
 diff --git a/dlls/nsiproxy.sys/ip.c b/dlls/nsiproxy.sys/ip.c
-index 002d2b48f5d..a6d5d8a2836 100644
+index 002d2b4..84b2cdc 100644
 --- a/dlls/nsiproxy.sys/ip.c
 +++ b/dlls/nsiproxy.sys/ip.c
 @@ -23,9 +23,11 @@
@@ -14,7 +14,231 @@ index 002d2b48f5d..a6d5d8a2836 100644
  
  #ifdef HAVE_NET_ROUTE_H
  #include <net/route.h>
-@@ -1499,84 +1501,126 @@ static NTSTATUS ipv4_forward_enumerate_all( void *key_data, UINT key_size, void
+@@ -814,6 +816,98 @@ static NTSTATUS ipv6_ipstats_get_all_parameters( const void *key, UINT key_size,
+ #endif
+ }
+ 
++#ifdef __ANDROID__
++#include <unistd.h>
++
++/* On Android the app sandbox filters getifaddrs() down to the loopback address, so the
++ * machine's real LAN address never reaches the NSI unicast/interface tables.  As a result
++ * GetAdaptersAddresses() only reports 127.0.0.1 and P2P/ICE sockets (e.g. Epic Online
++ * Services) bind to loopback and can never reach a peer.  Recover the active interface
++ * without enumerating: read the default route from /proc/net/route (readable under the
++ * sandbox) and use a connected UDP socket + getsockname() to learn the source address the
++ * kernel would use.  The result is returned as a synthetic struct ifaddrs the existing fill
++ * paths splice onto the front of the getifaddrs() list.  It only fires when enumeration is
++ * loopback-only, so normal Android configs and every non-Android build are unaffected. */
++static BOOL android_make_lan_ifaddr( struct ifaddrs *ifa, struct sockaddr_in *addr,
++                                     struct sockaddr_in *netmask, char *name )
++{
++    struct in_addr net = { 0 }, mask = { 0 }, local;
++    struct sockaddr_in dst;
++    socklen_t len;
++    char buf[512];
++    BOOL have_iface = FALSE;
++    FILE *fp;
++    int s;
++
++    /* Find the first non-loopback route to learn the active interface name, its subnet and
++     * netmask. Android often keeps the default route in a separate table that is not visible
++     * in /proc/net/route, so we do NOT require a default route - any on-link route on a real
++     * interface is enough. */
++    if (!(fp = fopen( "/proc/net/route", "r" ))) return FALSE;
++    if (!fgets( buf, sizeof(buf), fp )) { fclose( fp ); return FALSE; } /* header */
++    while (fgets( buf, sizeof(buf), fp ))
++    {
++        char iface[IFNAMSIZ];
++        unsigned int dest, m;
++        if (sscanf( buf, "%15s %x %*x %*x %*x %*x %*x %x", iface, &dest, &m ) < 3) continue;
++        if (!strcmp( iface, "lo" )) continue;
++        memcpy( name, iface, strlen( iface ) + 1 ); /* iface is <= 15 chars from %15s */
++        net.s_addr = dest;
++        mask.s_addr = m;
++        have_iface = TRUE;
++        break;
++    }
++    fclose( fp );
++    if (!have_iface) return FALSE;
++    if (!mask.s_addr) mask.s_addr = htonl( 0xffffff00 ); /* fall back to /24 */
++
++    /* Discover our source address by connecting a UDP socket to an on-link address in that
++     * subnet (network base | 1). connect() sends no packets; getsockname() then reports the
++     * source address the kernel assigns - which works even when the address list is filtered
++     * and without needing a default route. */
++    if ((s = socket( AF_INET, SOCK_DGRAM, 0 )) < 0) return FALSE;
++    memset( &dst, 0, sizeof(dst) );
++    dst.sin_family = AF_INET;
++    dst.sin_port = htons( 9 ); /* discard port */
++    dst.sin_addr.s_addr = net.s_addr | htonl( 1 );
++    if (connect( s, (struct sockaddr *)&dst, sizeof(dst) )) { close( s ); return FALSE; }
++    len = sizeof(dst);
++    if (getsockname( s, (struct sockaddr *)&dst, &len )) { close( s ); return FALSE; }
++    close( s );
++    local = dst.sin_addr;
++    if (!local.s_addr || (ntohl( local.s_addr ) >> 24) == 127) return FALSE;
++
++    memset( addr, 0, sizeof(*addr) );
++    addr->sin_family = AF_INET;
++    addr->sin_addr = local;
++    memset( netmask, 0, sizeof(*netmask) );
++    netmask->sin_family = AF_INET;
++    netmask->sin_addr = mask;
++    memset( ifa, 0, sizeof(*ifa) );
++    ifa->ifa_name = name;
++    ifa->ifa_flags = IFF_UP | IFF_RUNNING | IFF_BROADCAST | IFF_MULTICAST;
++    ifa->ifa_addr = (struct sockaddr *)addr;
++    ifa->ifa_netmask = (struct sockaddr *)netmask;
++    ifa->ifa_next = NULL;
++    TRACE( "android: recovered LAN interface %s addr %08x (getifaddrs was loopback-only)\n",
++           name, (unsigned int)ntohl( local.s_addr ) );
++    return TRUE;
++}
++
++/* TRUE if the getifaddrs() list has no non-loopback IPv4 address (the sandbox case). */
++static BOOL android_ipv4_is_loopback_only( struct ifaddrs *addrs )
++{
++    struct ifaddrs *e;
++    for (e = addrs; e; e = e->ifa_next)
++    {
++        if (!e->ifa_addr || e->ifa_addr->sa_family != AF_INET) continue;
++        if ((ntohl( ((struct sockaddr_in *)e->ifa_addr)->sin_addr.s_addr ) >> 24) != 127)
++            return FALSE;
++    }
++    return TRUE;
++}
++#endif /* __ANDROID__ */
++
+ static NTSTATUS ip_interface_fill( UINT fam, const char *unix_name, void *key_data, UINT key_size,
+                                    void *rw_data, UINT rw_size, void *dynamic_data, UINT dynamic_size,
+                                    void *static_data, UINT static_size, UINT_PTR *count )
+@@ -828,11 +922,25 @@ static NTSTATUS ip_interface_fill( UINT fam, const char *unix_name, void *key_da
+     struct ipv6_addr_scope *addr_scopes = NULL;
+     unsigned int addr_scopes_size = 0;
+     struct nsi_ip_interface_rw *rw = rw_data;
+-    struct ifaddrs *addrs, *entry, *entry2;
++    struct ifaddrs *addrs, *entry, *entry2, *real_addrs;
+     UINT num = 0, scope_id = 0xffffffff;
+     NET_LUID luid;
++#ifdef __ANDROID__
++    struct ifaddrs synth;
++    struct sockaddr_in synth_addr, synth_mask;
++    char synth_name[IFNAMSIZ];
++#endif
+ 
+-    if (getifaddrs( &addrs )) return STATUS_NO_MORE_ENTRIES;
++    if (getifaddrs( &real_addrs )) return STATUS_NO_MORE_ENTRIES;
++    addrs = real_addrs;
++#ifdef __ANDROID__
++    if (fam == AF_INET && android_ipv4_is_loopback_only( real_addrs ) &&
++        android_make_lan_ifaddr( &synth, &synth_addr, &synth_mask, synth_name ))
++    {
++        synth.ifa_next = real_addrs;
++        addrs = &synth;
++    }
++#endif
+ 
+     if (fam == AF_INET6) addr_scopes = get_ipv6_addr_scope_table( &addr_scopes_size );
+ 
+@@ -933,7 +1041,7 @@ static NTSTATUS ip_interface_fill( UINT fam, const char *unix_name, void *key_da
+         }
+         if (!count)
+         {
+-            freeifaddrs( addrs );
++            freeifaddrs( real_addrs );
+             free( addr_scopes );
+             return STATUS_SUCCESS;
+         }
+@@ -943,7 +1051,7 @@ static NTSTATUS ip_interface_fill( UINT fam, const char *unix_name, void *key_da
+         if (dyn) ++dyn;
+         if (stat) ++stat;
+     }
+-    freeifaddrs( addrs );
++    freeifaddrs( real_addrs );
+     free( addr_scopes );
+ 
+     if (!count) return STATUS_NOT_FOUND;
+@@ -1058,12 +1166,26 @@ static NTSTATUS ip_unicast_enumerate_all( int family, void *key_data, UINT key_s
+     UINT num = 0;
+     NTSTATUS status = STATUS_SUCCESS;
+     BOOL want_data = key_size || rw_size || dynamic_size || static_size;
+-    struct ifaddrs *addrs, *entry;
++    struct ifaddrs *addrs, *entry, *real_addrs;
++#ifdef __ANDROID__
++    struct ifaddrs synth;
++    struct sockaddr_in synth_addr, synth_mask;
++    char synth_name[IFNAMSIZ];
++#endif
+ 
+     TRACE( "%p %d %p %d %p %d %p %d %p\n", key_data, key_size, rw_data, rw_size,
+            dynamic_data, dynamic_size, static_data, static_size, count );
+ 
+-    if (getifaddrs( &addrs )) return STATUS_NO_MORE_ENTRIES;
++    if (getifaddrs( &real_addrs )) return STATUS_NO_MORE_ENTRIES;
++    addrs = real_addrs;
++#ifdef __ANDROID__
++    if (family == AF_INET && android_ipv4_is_loopback_only( real_addrs ) &&
++        android_make_lan_ifaddr( &synth, &synth_addr, &synth_mask, synth_name ))
++    {
++        synth.ifa_next = real_addrs;
++        addrs = &synth;
++    }
++#endif
+ 
+     for (entry = addrs; entry; entry = entry->ifa_next)
+     {
+@@ -1080,7 +1202,7 @@ static NTSTATUS ip_unicast_enumerate_all( int family, void *key_data, UINT key_s
+         num++;
+     }
+ 
+-    freeifaddrs( addrs );
++    freeifaddrs( real_addrs );
+ 
+     if (!want_data || num <= *count) *count = num;
+     else status = STATUS_BUFFER_OVERFLOW;
+@@ -1112,15 +1234,29 @@ static NTSTATUS ip_unicast_get_all_parameters( const void *key, UINT key_size, v
+     NTSTATUS status = STATUS_NOT_FOUND;
+     const struct nsi_ipv6_unicast_key *key6 = key;
+     const struct nsi_ipv4_unicast_key *key4 = key;
+-    struct ifaddrs *addrs, *entry;
++    struct ifaddrs *addrs, *entry, *real_addrs;
+     const char *unix_name;
++#ifdef __ANDROID__
++    struct ifaddrs synth;
++    struct sockaddr_in synth_addr, synth_mask;
++    char synth_name[IFNAMSIZ];
++#endif
+ 
+     TRACE( "%p %d %p %d %p %d %p %d\n", key, key_size, rw_data, rw_size, dynamic_data, dynamic_size,
+            static_data, static_size );
+ 
+     if (!convert_luid_to_unix_name( &key6->luid, &unix_name )) return STATUS_NOT_FOUND;
+ 
+-    if (getifaddrs( &addrs )) return STATUS_NO_MORE_ENTRIES;
++    if (getifaddrs( &real_addrs )) return STATUS_NO_MORE_ENTRIES;
++    addrs = real_addrs;
++#ifdef __ANDROID__
++    if (family == AF_INET && android_ipv4_is_loopback_only( real_addrs ) &&
++        android_make_lan_ifaddr( &synth, &synth_addr, &synth_mask, synth_name ))
++    {
++        synth.ifa_next = real_addrs;
++        addrs = &synth;
++    }
++#endif
+ 
+     for (entry = addrs; entry; entry = entry->ifa_next)
+     {
+@@ -1137,7 +1273,7 @@ static NTSTATUS ip_unicast_get_all_parameters( const void *key, UINT key_size, v
+         break;
+     }
+ 
+-    freeifaddrs( addrs );
++    freeifaddrs( real_addrs );
+     return status;
+ }
+ 
+@@ -1499,84 +1635,126 @@ static NTSTATUS ipv4_forward_enumerate_all( void *key_data, UINT key_size, void
  
  #ifdef __linux__
      {
@@ -107,12 +331,12 @@ index 002d2b48f5d..a6d5d8a2836 100644
 -            break;
 -        }
 -        freeifaddrs( addrs );
+-
+-        if (!(fp = fopen( "/proc/net/route", "r" ))) return STATUS_NOT_SUPPORTED;
 +                if (!(ifentry->ifa_flags & IFF_LOOPBACK)) continue;
 +                if (!convert_unix_name_to_luid( ifentry->ifa_name, &entry.luid )) continue;
 +                if (!convert_luid_to_index( &entry.luid, &entry.if_index )) continue;
  
--        if (!(fp = fopen( "/proc/net/route", "r" ))) return STATUS_NOT_SUPPORTED;
--
 -        /* skip header line */
 -        fgets( buf, sizeof(buf), fp );
 -        while ((ptr = fgets( buf, sizeof(buf), fp )))
@@ -210,7 +434,7 @@ index 002d2b48f5d..a6d5d8a2836 100644
      }
  #elif defined(HAVE_SYS_SYSCTL_H) && defined(NET_RT_DUMP)
      {
-@@ -1796,50 +1840,93 @@ static NTSTATUS ipv6_forward_enumerate_all( void *key_data, UINT key_size, void
+@@ -1796,50 +1974,93 @@ static NTSTATUS ipv6_forward_enumerate_all( void *key_data, UINT key_size, void
  
  #ifdef __linux__
      {
