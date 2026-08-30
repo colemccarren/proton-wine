@@ -1,8 +1,43 @@
 diff --git a/dlls/ws2_32/unixlib.c b/dlls/ws2_32/unixlib.c
-index e0e1263..de3a52d 100644
+index e0e1263..513b102 100644
 --- a/dlls/ws2_32/unixlib.c
 +++ b/dlls/ws2_32/unixlib.c
-@@ -1044,9 +1044,44 @@ static NTSTATUS unix_gethostname( void *args )
+@@ -752,6 +752,34 @@ static NTSTATUS unix_getaddrinfo( void *args )
+     }
+ 
+     ret = getaddrinfo( params->node, service, hints ? &unix_hints : NULL, &unix_info );
++#ifdef __ANDROID__
++    /* bionic's resolver rejects or mishandles hint combinations that Windows accepts:
++     * AI_V4MAPPED / AI_ALL are unsupported, and AI_ADDRCONFIG consults the interface
++     * list, which the app sandbox filters down to loopback - suppressing all results
++     * for a name that plain lookups resolve fine.  Epic Online Services' websocket
++     * stack passes such hints and gets an empty answer, so its wss:// connections
++     * never even reach socket creation.  Retry once with relaxed hints; a caller that
++     * asked for v4-mapped IPv6 gets plain IPv4 records instead, which every dual-stack
++     * consumer of AF_UNSPEC results already handles. */
++    if (hints && (ret || !unix_info))
++    {
++        struct addrinfo relaxed = unix_hints;
++
++        relaxed.ai_family = AF_UNSPEC;
++#ifdef AI_ADDRCONFIG
++        relaxed.ai_flags &= ~AI_ADDRCONFIG;
++#endif
++#ifdef AI_V4MAPPED
++        relaxed.ai_flags &= ~AI_V4MAPPED;
++#endif
++#ifdef AI_ALL
++        relaxed.ai_flags &= ~AI_ALL;
++#endif
++        TRACE( "android: getaddrinfo returned %d with flags %#x family %d, retrying with flags %#x family 0\n",
++               ret, unix_hints.ai_flags, unix_hints.ai_family, relaxed.ai_flags );
++        ret = getaddrinfo( params->node, service, &relaxed, &unix_info );
++    }
++#endif
+     if (ret)
+         return addrinfo_err_from_unix( ret );
+ 
+@@ -1044,9 +1072,44 @@ static NTSTATUS unix_gethostname( void *args )
  {
      struct gethostname_params *params = args;
  
