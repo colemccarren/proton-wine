@@ -1,5 +1,5 @@
 diff --git a/dlls/nsiproxy.sys/ip.c b/dlls/nsiproxy.sys/ip.c
-index 002d2b4..84b2cdc 100644
+index 002d2b4..12fcaa4 100644
 --- a/dlls/nsiproxy.sys/ip.c
 +++ b/dlls/nsiproxy.sys/ip.c
 @@ -23,9 +23,11 @@
@@ -45,7 +45,7 @@ index 002d2b4..84b2cdc 100644
 +     * netmask. Android often keeps the default route in a separate table that is not visible
 +     * in /proc/net/route, so we do NOT require a default route - any on-link route on a real
 +     * interface is enough. */
-+    if (!(fp = fopen( "/proc/net/route", "r" ))) return FALSE;
++    if (!(fp = fopen( "/proc/net/route", "r" ))) { WARN( "android: cannot open /proc/net/route\n" ); return FALSE; }
 +    if (!fgets( buf, sizeof(buf), fp )) { fclose( fp ); return FALSE; } /* header */
 +    while (fgets( buf, sizeof(buf), fp ))
 +    {
@@ -60,24 +60,24 @@ index 002d2b4..84b2cdc 100644
 +        break;
 +    }
 +    fclose( fp );
-+    if (!have_iface) return FALSE;
++    if (!have_iface) { WARN( "android: no non-loopback route found\n" ); return FALSE; }
 +    if (!mask.s_addr) mask.s_addr = htonl( 0xffffff00 ); /* fall back to /24 */
 +
 +    /* Discover our source address by connecting a UDP socket to an on-link address in that
 +     * subnet (network base | 1). connect() sends no packets; getsockname() then reports the
 +     * source address the kernel assigns - which works even when the address list is filtered
 +     * and without needing a default route. */
-+    if ((s = socket( AF_INET, SOCK_DGRAM, 0 )) < 0) return FALSE;
++    if ((s = socket( AF_INET, SOCK_DGRAM, 0 )) < 0) { WARN( "android: probe socket failed\n" ); return FALSE; }
 +    memset( &dst, 0, sizeof(dst) );
 +    dst.sin_family = AF_INET;
 +    dst.sin_port = htons( 9 ); /* discard port */
 +    dst.sin_addr.s_addr = net.s_addr | htonl( 1 );
-+    if (connect( s, (struct sockaddr *)&dst, sizeof(dst) )) { close( s ); return FALSE; }
++    if (connect( s, (struct sockaddr *)&dst, sizeof(dst) )) { WARN( "android: probe connect failed\n" ); close( s ); return FALSE; }
 +    len = sizeof(dst);
-+    if (getsockname( s, (struct sockaddr *)&dst, &len )) { close( s ); return FALSE; }
++    if (getsockname( s, (struct sockaddr *)&dst, &len )) { WARN( "android: probe getsockname failed\n" ); close( s ); return FALSE; }
 +    close( s );
 +    local = dst.sin_addr;
-+    if (!local.s_addr || (ntohl( local.s_addr ) >> 24) == 127) return FALSE;
++    if (!local.s_addr || (ntohl( local.s_addr ) >> 24) == 127) { WARN( "android: probe returned loopback/zero\n" ); return FALSE; }
 +
 +    memset( addr, 0, sizeof(*addr) );
 +    addr->sin_family = AF_INET;
@@ -159,7 +159,7 @@ index 002d2b4..84b2cdc 100644
      free( addr_scopes );
  
      if (!count) return STATUS_NOT_FOUND;
-@@ -1058,12 +1166,26 @@ static NTSTATUS ip_unicast_enumerate_all( int family, void *key_data, UINT key_s
+@@ -1058,12 +1166,33 @@ static NTSTATUS ip_unicast_enumerate_all( int family, void *key_data, UINT key_s
      UINT num = 0;
      NTSTATUS status = STATUS_SUCCESS;
      BOOL want_data = key_size || rw_size || dynamic_size || static_size;
@@ -178,6 +178,13 @@ index 002d2b4..84b2cdc 100644
 +    if (getifaddrs( &real_addrs )) return STATUS_NO_MORE_ENTRIES;
 +    addrs = real_addrs;
 +#ifdef __ANDROID__
++    if (TRACE_ON(nsi))
++    {
++        for (entry = real_addrs; entry; entry = entry->ifa_next)
++            if (entry->ifa_addr && entry->ifa_addr->sa_family == AF_INET)
++                TRACE( "android: getifaddrs %s -> %08x\n", entry->ifa_name,
++                       (unsigned int)ntohl( ((struct sockaddr_in *)entry->ifa_addr)->sin_addr.s_addr ) );
++    }
 +    if (family == AF_INET && android_ipv4_is_loopback_only( real_addrs ) &&
 +        android_make_lan_ifaddr( &synth, &synth_addr, &synth_mask, synth_name ))
 +    {
@@ -188,7 +195,7 @@ index 002d2b4..84b2cdc 100644
  
      for (entry = addrs; entry; entry = entry->ifa_next)
      {
-@@ -1080,7 +1202,7 @@ static NTSTATUS ip_unicast_enumerate_all( int family, void *key_data, UINT key_s
+@@ -1080,7 +1209,7 @@ static NTSTATUS ip_unicast_enumerate_all( int family, void *key_data, UINT key_s
          num++;
      }
  
@@ -197,7 +204,7 @@ index 002d2b4..84b2cdc 100644
  
      if (!want_data || num <= *count) *count = num;
      else status = STATUS_BUFFER_OVERFLOW;
-@@ -1112,15 +1234,29 @@ static NTSTATUS ip_unicast_get_all_parameters( const void *key, UINT key_size, v
+@@ -1112,15 +1241,29 @@ static NTSTATUS ip_unicast_get_all_parameters( const void *key, UINT key_size, v
      NTSTATUS status = STATUS_NOT_FOUND;
      const struct nsi_ipv6_unicast_key *key6 = key;
      const struct nsi_ipv4_unicast_key *key4 = key;
@@ -229,7 +236,7 @@ index 002d2b4..84b2cdc 100644
  
      for (entry = addrs; entry; entry = entry->ifa_next)
      {
-@@ -1137,7 +1273,7 @@ static NTSTATUS ip_unicast_get_all_parameters( const void *key, UINT key_size, v
+@@ -1137,7 +1280,7 @@ static NTSTATUS ip_unicast_get_all_parameters( const void *key, UINT key_size, v
          break;
      }
  
@@ -238,7 +245,7 @@ index 002d2b4..84b2cdc 100644
      return status;
  }
  
-@@ -1499,84 +1635,126 @@ static NTSTATUS ipv4_forward_enumerate_all( void *key_data, UINT key_size, void
+@@ -1499,84 +1642,126 @@ static NTSTATUS ipv4_forward_enumerate_all( void *key_data, UINT key_size, void
  
  #ifdef __linux__
      {
@@ -331,12 +338,12 @@ index 002d2b4..84b2cdc 100644
 -            break;
 -        }
 -        freeifaddrs( addrs );
--
--        if (!(fp = fopen( "/proc/net/route", "r" ))) return STATUS_NOT_SUPPORTED;
 +                if (!(ifentry->ifa_flags & IFF_LOOPBACK)) continue;
 +                if (!convert_unix_name_to_luid( ifentry->ifa_name, &entry.luid )) continue;
 +                if (!convert_luid_to_index( &entry.luid, &entry.if_index )) continue;
  
+-        if (!(fp = fopen( "/proc/net/route", "r" ))) return STATUS_NOT_SUPPORTED;
+-
 -        /* skip header line */
 -        fgets( buf, sizeof(buf), fp );
 -        while ((ptr = fgets( buf, sizeof(buf), fp )))
@@ -434,7 +441,7 @@ index 002d2b4..84b2cdc 100644
      }
  #elif defined(HAVE_SYS_SYSCTL_H) && defined(NET_RT_DUMP)
      {
-@@ -1796,50 +1974,93 @@ static NTSTATUS ipv6_forward_enumerate_all( void *key_data, UINT key_size, void
+@@ -1796,50 +1981,93 @@ static NTSTATUS ipv6_forward_enumerate_all( void *key_data, UINT key_size, void
  
  #ifdef __linux__
      {
